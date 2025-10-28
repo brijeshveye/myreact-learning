@@ -1,0 +1,192 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_DIR = '/var/www/app'
+        RELEASE_DIR = "${APP_DIR}/releases/${BUILD_NUMBER}"
+        CURRENT_DIR = "${APP_DIR}/current"
+        DEPLOY_USER = 'user'
+        SERVERS = "server1.example.com server2.example.com"
+        GIT_CREDENTIALS_ID = 'github-ssh-key' // <-- Jenkins credential ID for GitHub SSH key
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds() // Prevent multiple deployments at once
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "🔍 Checking out code from GitHub..."
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],  // or your branch
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'CleanBeforeCheckout']], // ensures clean workspace
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[
+                        credentialsId: "${GIT_CREDENTIALS_ID}",
+                        url: 'git@github.com:yourorg/your-repo.git'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Install Dependencies & Test') {
+            steps {
+                sh '''
+                    composer install --no-interaction
+                    cp .env.example .env
+                    php artisan key:generate
+                    php artisan test --no-interaction
+                '''
+            }
+        }
+
+        stage('Build Assets') {
+            steps {
+                sh '''
+                    composer dump-autoload --optimize --no-dev --classmap-authoritative
+                    npm ci
+                    npm run build
+                '''
+            }
+        }
+
+        stage('Package') {
+            steps {
+                sh '''
+                    tar czf release_${BUILD_NUMBER}.tar.gz \
+                        --exclude=.git \
+                        --exclude=node_modules \
+                        --exclude=tests \
+                        --exclude=.env \
+                        --exclude=storage \
+                        .
+                '''
+            }
+        }
+
+        stage('Backup Database') {
+            steps {
+                script {
+                    sh """
+                        ssh ${DEPLOY_USER}@${SERVERS.split()[0]} '
+                            if [ -d ${APP_DIR}/current ]; then
+                                cd ${APP_DIR}/current
+                                php artisan backup:run --only-db 2>/dev/null || echo "⚠️ Backup command not available"
+                            fi
+                        ' || echo "⚠️ Backup skipped"
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Servers') {
+            steps {
+                script {
+                    def servers = SERVERS.split()
+                    def deploySteps = [:]
+
+                    servers.each { server ->
+                        deploySteps[server] = {
+                            echo "---- 🚀 Deploying to ${server} ----"
+                            sh """
+                                scp release_${BUILD_NUMBER}.tar.gz ${DEPLOY_USER}@${server}:${APP_DIR}/
+                                ssh ${DEPLOY_USER}@${server} '
+                                    set -e
+
+                                    mkdir -p ${RELEASE_DIR}
+                                    tar xzf ${APP_DIR}/release_${BUILD_NUMBER}.tar.gz -C ${RELEASE_DIR}
+
+                                    ln -nfs ${APP_DIR}/shared/.env ${RELEASE_DIR}/.env
+                                    ln -nfs ${APP_DIR}/shared/storage ${RELEASE_DIR}/storage
+
+                                    if [ -L ${CURRENT_DIR} ]; then
+                                        PREV_RELEASE=\$(readlink -f ${CURRENT_DIR})
+                                        ln -nfs "\$PREV_RELEASE" ${APP_DIR}/previous
+                                    fi
+
+                                    cd ${RELEASE_DIR}
+                                    composer dump-autoload --optimize
+                                    php artisan migrate --force
+                                    php artisan config:cache
+                                    php artisan route:cache
+                                    php artisan view:cache
+                                    php artisan event:cache
+
+                                    ln -nfs ${RELEASE_DIR} ${CURRENT_DIR}
+                                    sudo systemctl reload php8.2-fpm
+                                    php artisan queue:restart
+
+                                    rm -f ${APP_DIR}/release_${BUILD_NUMBER}.tar.gz
+
+                                    sleep 3
+                                    curl -fsS http://localhost/health || (echo "❌ Health check failed on ${server}" && exit 1)
+
+                                    echo "✅ ${server} deployment successful"
+                                '
+                            """
+                        }
+                    }
+
+                    parallel deploySteps
+                }
+            }
+        }
+
+        stage('Cleanup Old Releases') {
+            steps {
+                script {
+                    def servers = SERVERS.split()
+                    servers.each { server ->
+                        sh """
+                            ssh ${DEPLOY_USER}@${server} '
+                                cd ${APP_DIR}/releases &&
+                                ls -t | tail -n +6 | xargs -r rm -rf &&
+                                echo "🧹 Cleaned old releases on ${server}"
+                            ' || true
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Deployment successful to all servers (Build #${BUILD_NUMBER})"
+        }
+
+        failure {
+            echo "❌ Deployment failed. Attempting rollback..."
+            script {
+                def servers = SERVERS.split()
+                servers.each { server ->
+                    sh """
+                        ssh ${DEPLOY_USER}@${server} '
+                            if [ -L ${APP_DIR}/previous ]; then
+                                PREV_PATH=\$(readlink -f ${APP_DIR}/previous 2>/dev/null) || exit 0
+                                if [ -d "\$PREV_PATH" ]; then
+                                    ln -nfs "\$PREV_PATH" ${CURRENT_DIR}
+                                    sudo systemctl reload php8.2-fpm
+                                    php artisan queue:restart
+                                    echo "🔄 Rolled back ${server} to \$PREV_PATH"
+                                fi
+                            else
+                                echo "⚠️ No previous release found on ${server}"
+                            fi
+                        ' || echo "⚠️ Rollback failed on ${server}"
+                    """
+                }
+            }
+        }
+
+        always {
+            cleanWs(deleteDirs: true, patterns: [[pattern: 'release_*.tar.gz', type: 'INCLUDE']])
+        }
+    }
+}
